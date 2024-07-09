@@ -1,92 +1,104 @@
 #!/usr/bin/env php
 <?php
-/* Copyright 2024 Romain "Artefact2" Dal Maso <romain.dalmaso@artefact2.com>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *         http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 const TOP_K = 50;
 const PARALLEL_REQUESTS = 16;
 
 if($argc !== 3) {
-	fprintf(STDERR, "Usage: %s <server-addr:port> <prompt>\n", $argv[0]);
-	die(1);
+    fprintf(STDERR, "Usage: %s <server-addr:port> <prompt>\n", $argv[0]);
+    die(1);
 }
 
 $gen_completion_request = function(array $params) use($argv): CurlHandle {
 	$c = curl_init();
-	curl_setopt($c, CURLOPT_URL, 'http://'.$argv[1].'/completion');
+	$url = 'http://'.$argv[1].'/completion';
+	curl_setopt($c, CURLOPT_URL, $url);
 	curl_setopt($c, CURLOPT_FAILONERROR, true);
 	curl_setopt($c, CURLOPT_RETURNTRANSFER, true);
 	curl_setopt($c, CURLOPT_TIMEOUT, 300);
 	curl_setopt($c, CURLOPT_POST, true);
 	curl_setopt($c, CURLOPT_POSTFIELDS, json_encode($params));
 	curl_setopt($c, CURLOPT_HTTPHEADER, [
-		'Content-Type' => 'application/json',
-		'Accept' => 'application/json',
+			'Content-Type: application/json',
+			'Accept: application/json',
 	]);
 	return $c;
 };
 
-$ans = json_decode(curl_exec($gen_completion_request([
-	//'prompt' => $fullprompt = "[INST]What word is missing from the sentence below? Answer with a single word only.\n\n\"".$argv[2]."\"[/INST]",
+$initial_response = curl_exec($gen_completion_request([
 	'prompt' => $fullprompt = $argv[2],
 	'cache_prompt' => true,
 	'n_predict' => 1,
 	'n_probs' => 1000,
 	'samplers' => [ 'top_k' ],
 	'top_k' => 1000,
-])), true);
+]));
+
+if ($initial_response === false) {
+    fprintf(STDERR, "Error: Initial cURL request failed\n");
+    die(1);
+}
+
+$ans = json_decode($initial_response, true);
+
+if (json_last_error() !== JSON_ERROR_NONE) {
+    fprintf(STDERR, "Error: Failed to decode JSON response: " . json_last_error_msg() . "\n");
+    die(1);
+}
+
+if (!isset($ans['completion_probabilities'][0]['probs']) || !is_array($ans['completion_probabilities'][0]['probs'])) {
+    fprintf(STDERR, "Error: Unexpected response structure. 'completion_probabilities' array is missing or empty.\n");
+    fprintf(STDERR, "Response: " . print_r($ans, true) . "\n");
+    die(1);
+}
 
 $out = [ $argv[2], [] ];
-
 $m = curl_multi_init();
 $handles = 0;
 
 while(count($out[1]) < TOP_K) {
-	while($handles < PARALLEL_REQUESTS) {
-		++$handles;
-		$tok = array_shift($ans['completion_probabilities'][0]['probs']);
-		$c = $gen_completion_request([
-			'prompt' => $fullprompt.$tok['tok_str'],
-			'cache_prompt' => true,
-			'n_predict' => 5,
-			'samplers' => [ 'top_k' ],
-			'top_k' => 1,
-		]);
-		curl_setopt($c, CURLOPT_PRIVATE, $tok);
-		curl_multi_add_handle($m, $c);
-	}
+    while($handles < PARALLEL_REQUESTS && !empty($ans['completion_probabilities'][0]['probs'])) {
+        ++$handles;
+        $tok = array_shift($ans['completion_probabilities'][0]['probs']);
+        $c = $gen_completion_request([
+            'prompt' => $fullprompt.$tok['tok_str'],
+            'cache_prompt' => true,
+            'n_predict' => 5,
+            'samplers' => [ 'top_k' ],
+            'top_k' => 1,
+        ]);
+        curl_setopt($c, CURLOPT_PRIVATE, json_encode($tok));
+        curl_multi_add_handle($m, $c);
+    }
 
-	do {
-		curl_multi_exec($m, $running);
-		sleep(1);
-	} while($running === $handles);
+    if ($handles === 0) {
+        fprintf(STDERR, "Warning: No more tokens to process\n");
+        break;
+    }
 
-	while(($info = curl_multi_info_read($m)) !== false) {
-		fprintf(STDERR, '.');
-		$c = $info['handle'];
-		$tok = curl_getinfo($c, CURLINFO_PRIVATE);
-		$ret = json_decode(curl_multi_getcontent($c), true);
-		curl_multi_remove_handle($m, $c);
-		curl_close($c);
-		--$handles;
+    do {
+        curl_multi_exec($m, $running);
+        curl_multi_select($m, 1.0);
+    } while($running > 0);
 
-		$word = trim($tok['tok_str'].$ret['content']);
-		if(!preg_match('/^((\pL|\pN)+)/u', $word, $matches)) continue;
-		$word = $matches[1];
-		$out[1][$word] = ($out[1][$word] ?? 0) + $tok['prob'];
-	}
+    while(($info = curl_multi_info_read($m)) !== false) {
+        fprintf(STDERR, '.');
+        $c = $info['handle'];
+        $tok = json_decode(curl_getinfo($c, CURLINFO_PRIVATE), true);
+        $ret = json_decode(curl_multi_getcontent($c), true);
+        curl_multi_remove_handle($m, $c);
+        curl_close($c);
+        --$handles;
+
+        if ($ret === null || !isset($ret['content'])) {
+            fprintf(STDERR, "Warning: Invalid response for token '{$tok['tok_str']}'\n");
+            continue;
+        }
+
+        $word = trim($tok['tok_str'].$ret['content']);
+        if(!preg_match('/^((\pL|\pN)+)/u', $word, $matches)) continue;
+        $word = $matches[1];
+        $out[1][$word] = ($out[1][$word] ?? 0) + $tok['prob'];
+    }
 }
 
 fprintf(STDERR, "\n");
